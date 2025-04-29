@@ -635,7 +635,7 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
             if i > 0 and i-1 < len(self.velocities):
                 vel = self.velocities[i-1]
 
-            # Acceleration calculation
+            # Acceleration calculatio
             accel = 0.0
             if i > 1 and i-2 < len(self.accelerations):
                 accel = self.accelerations[i-2]
