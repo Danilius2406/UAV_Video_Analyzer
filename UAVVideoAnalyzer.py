@@ -462,7 +462,7 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
                     y2 = min(frame_gray.shape[0], y + half_size)
                     self.template = frame_gray[y1:y2, x1:x2]
 
-                    self.tracking_active = True  # Keep tracking activ
+                    self.tracking_active = True  # Keep tracking active
 
                 self.display_frame(frame)
                 self.status_bar.showMessage(f"Frame {self.frame_count+1}: Position ({x}, {y})")
