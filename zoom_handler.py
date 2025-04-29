@@ -57,7 +57,7 @@ class ZoomableVideoWidget(QLabel):
             Qt.SmoothTransformation
         )
 
-        final_pixmap = QPixmap(self.size())
+        final_pixmap = QPixmap(self.size() )
         final_pixmap.fill(Qt.white)
 
         painter = QPainter(final_pixmap)
