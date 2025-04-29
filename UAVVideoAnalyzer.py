@@ -252,6 +252,7 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
             options=options)
 
         if file_path:
+            self.video_path = file_path
             self.cap = cv2.VideoCapture(file_path)
             if not self.cap.isOpened():
                 QMessageBox.critical(self, "Error", "Could not open video file.")
@@ -350,7 +351,6 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
         ret, frame = self.cap.read()
         if not ret:
             self.timer.stop()
-            self.cap.release()
             self.export_button.setEnabled(True)
             self.status_bar.showMessage("Video processing complete. Ready to export data.")
             return
@@ -439,33 +439,45 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
         self.update_table()
 
     def prev_frame(self):
-        if self.cap is not None and self.frame_count > 0:
+        if self.cap is not None and self.cap.isOpened():
             self.paused = True
             self.play_button.setText("Play")
-            self.frame_count -= 1
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.frame_count)
-            ret, frame = self.cap.read()
-            if ret:
-                self.current_frame = frame.copy()
 
-                # Update tracking point if we have data for this frame
-                if len(self.positions) > self.frame_count:
-                    x, y = self.positions[self.frame_count]
-                    self.tracking_point = QPoint(x, y)
+            current_frame_pos = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
 
-                    # Update template for better tracking when resuming
-                    frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                    half_size = self.template_size // 2
-                    x1 = max(0, x - half_size)
-                    y1 = max(0, y - half_size)
-                    x2 = min(frame_gray.shape[1], x + half_size)
-                    y2 = min(frame_gray.shape[0], y + half_size)
-                    self.template = frame_gray[y1:y2, x1:x2]
+            prev_frame_number = max(0, current_frame_pos - 2)
 
-                    self.tracking_active = True  # Keep tracking active
+            try:
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, prev_frame_number)
+                ret, frame = self.cap.read()
 
-                self.display_frame(frame)
-                self.status_bar.showMessage(f"Frame {self.frame_count+1}: Position ({x}, {y})")
+                if ret:
+                    self.current_frame = frame.copy()
+                    self.frame_count = prev_frame_number + 1
+
+                    if len(self.positions) > self.frame_count - 1:
+                        x, y = self.positions[self.frame_count - 1]
+                        self.tracking_point = QPoint(x, y)
+
+                        if self.tracking_active and x is not None and y is not None:
+                            frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                            half_size = self.template_size // 2
+                            x1 = max(0, x - half_size)
+                            y1 = max(0, y - half_size)
+                            x2 = min(frame_gray.shape[1], x + half_size)
+                            y2 = min(frame_gray.shape[0], y + half_size)
+
+                            if x1 < x2 and y1 < y2:
+                                self.template = frame_gray[y1:y2, x1:x2]
+
+                    self.display_frame(frame)
+                    self.status_bar.showMessage(f"Frame {self.frame_count}")
+                else:
+                    self.status_bar.showMessage("Reached start of video")
+
+            except Exception as e:
+                self.status_bar.showMessage(f"Error: {str(e)}")
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame_pos)
 
     def next_frame(self):
         if self.cap is not None:
@@ -476,25 +488,32 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
                 self.current_frame = frame.copy()
                 self.frame_count += 1
 
-                # Update tracking point if we have data for this frame
-                if len(self.positions) > self.frame_count - 1:
+                if len(self.positions) >= self.frame_count:
                     x, y = self.positions[self.frame_count - 1]
                     self.tracking_point = QPoint(x, y)
 
-                    # Update template for better tracking when resuming
-                    frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                    half_size = self.template_size // 2
-                    x1 = max(0, x - half_size)
-                    y1 = max(0, y - half_size)
-                    x2 = min(frame_gray.shape[1], x + half_size)
-                    y2 = min(frame_gray.shape[0], y + half_size)
-                    self.template = frame_gray[y1:y2, x1:x2]
-
-                    self.tracking_active = True  # Keep tracking active
+                    if self.tracking_active:
+                        frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                        half_size = self.template_size // 2
+                        x1 = max(0, x - half_size)
+                        y1 = max(0, y - half_size)
+                        x2 = min(frame_gray.shape[1], x + half_size)
+                        y2 = min(frame_gray.shape[0], y + half_size)
+                        self.template = frame_gray[y1:y2, x1:x2]
+                else:
+                    self.tracking_point = None
+                    self.tracking_active = False
 
                 self.display_frame(frame)
-                self.status_bar.showMessage(f"Frame {self.frame_count+1}: Position ({x}, {y})")
+                status_msg = f"Frame {self.frame_count}"
+                if self.tracking_point:
+                    status_msg += f": Position ({self.tracking_point.x()}, {self.tracking_point.y()})"
+                self.status_bar.showMessage(status_msg)
 
+    def reopen_video(self):
+        if hasattr(self, 'video_path'):
+            self.cap = cv2.VideoCapture(self.video_path)
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.frame_count)
     def toggle_play(self):
         self.paused = not self.paused
         self.play_button.setText("Pause" if not self.paused else "Play")
