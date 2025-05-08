@@ -1,14 +1,14 @@
 import cv2
 import numpy as np
 import pandas as pd
-from PyQt5 import QtWidgets, QtGui, QtCore
+from PyQt5 import QtWidgets, QtGui
 from PyQt5.QtWidgets import (QFileDialog, QVBoxLayout, QPushButton,
                              QLabel, QHBoxLayout, QTableWidget,
                              QTableWidgetItem, QMessageBox, QInputDialog,
                              QSpinBox, QFormLayout)
 from PyQt5.QtCore import QTimer, Qt, QPoint
 import sys
-import time
+
 from zoom_handler import ZoomableVideoWidget
 
 
@@ -33,7 +33,6 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
         self.user_declared_fps = 30.0
         self.current_frame = None
         self.tracking_active = False
-        self.prev_gray = None
         self.setFocusPolicy(Qt.StrongFocus)
         self.trajectory = []  # Stores all historical points
         self.show_trajectory = False
@@ -42,6 +41,8 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
         self.dash_length = 10  # Length of each dash segment
         self.gap_length = 5    # Length of gap between dashes
         self.max_trajectory_points = 1000  # Maximum points to keep in trajectory
+        self.video_label.clicked.connect(self.handle_video_click)
+        self.setting_tracking = False
 
     def initUI(self):
         self.setWindowTitle("UAV Tracking Analyzer")
@@ -51,7 +52,6 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
         self.video_label = ZoomableVideoWidget(self)
         self.video_label.setAlignment(Qt.AlignCenter)
         self.video_label.setMinimumSize(640, 480)
-        self.video_label.mousePressEvent = self.video_label_clicked
 
         self.table = QTableWidget(self)
         self.table.setColumnCount(4)
@@ -77,6 +77,10 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
         self.set_scale_button.clicked.connect(self.set_scale)
         self.set_scale_button.setEnabled(False)
 
+        self.set_tracking_button = QPushButton("Set Tracking Point", self)
+        self.set_tracking_button.clicked.connect(self.toggle_set_tracking_mode)
+        self.set_tracking_button.setEnabled(False)
+
         self.prev_frame_button = QPushButton("Previous Frame", self)
         self.prev_frame_button.clicked.connect(self.prev_frame)
         self.prev_frame_button.setEnabled(False)
@@ -91,12 +95,15 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
 
         self.traj_button = QPushButton("Show Trajectory", self)
         self.traj_button.clicked.connect(self.toggle_trajectory)
+        self.traj_button.setEnabled(False)
 
         self.traj_style_button = QPushButton("Trajectory Style", self)
         self.traj_style_button.clicked.connect(self.set_trajectory_style)
+        self.traj_style_button.setEnabled(False)
 
         self.clear_traj_button = QPushButton("Clear Trajectory", self)
         self.clear_traj_button.clicked.connect(self.clear_trajectory)
+        self.clear_traj_button.setEnabled(False)
 
         button_layout = QHBoxLayout()
         button_layout.addWidget(self.load_button)
@@ -104,6 +111,7 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
         button_layout.addWidget(self.prev_frame_button)
         button_layout.addWidget(self.next_frame_button)
         button_layout.addWidget(self.set_scale_button)
+        button_layout.addWidget(self.set_tracking_button)
         button_layout.addWidget(self.export_button)
         button_layout.addWidget(self.check_fps_button)
         button_layout.addWidget(self.traj_button)
@@ -118,8 +126,89 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
         container.setLayout(main_layout)
         self.setCentralWidget(container)
 
-        # Status bar
         self.status_bar = self.statusBar()
+
+    def handle_video_click(self, pos):
+        try:
+            if not self.setting_tracking or self.current_frame is None:
+                return
+
+            frame_height, frame_width = self.current_frame.shape[:2]
+            x = max(0, min(pos.x(), frame_width-1))
+            y = max(0, min(pos.y(), frame_height-1))
+
+            self.set_tracking_point(QPoint(x, y))
+
+        except Exception as e:
+            self.status_bar.showMessage(f"Click error: {str(e)}")
+
+    def set_tracking_point(self, pos):
+        try:
+            if self.current_frame is None:
+                self.status_bar.showMessage("Error: No video frame loaded")
+                return
+
+            frame_height, frame_width = self.current_frame.shape[:2]
+
+            x = max(0, min(pos.x(), frame_width-1))
+            y = max(0, min(pos.y(), frame_height-1))
+
+            self.tracking_point = QPoint(x, y)
+            self.tracking_active = True
+
+            frame_gray = cv2.cvtColor(self.current_frame, cv2.COLOR_BGR2GRAY)
+            half_size = self.template_size // 2
+
+            x1 = max(0, x - half_size)
+            y1 = max(0, y - half_size)
+            x2 = min(frame_width, x + half_size)
+            y2 = min(frame_height, y + half_size)
+
+            if x1 >= x2 or y1 >= y2:
+                raise ValueError("Invalid template region")
+
+            self.template = frame_gray[y1:y2, x1:x2]
+
+            marker_frame = self.current_frame.copy()
+            cv2.drawMarker(marker_frame, (x, y), (0, 255, 255),
+                           markerType=cv2.MARKER_CROSS,
+                           markerSize=20,
+                           thickness=2)
+            self.display_frame(marker_frame)
+            self.status_bar.showMessage(f"Tracking point: ({x}, {y})")
+
+        except Exception as e:
+            self.status_bar.showMessage(f"Tracking Error: {str(e)}")
+            self.tracking_active = False
+
+    def toggle_set_tracking_mode(self):
+        self.setting_tracking = not self.setting_tracking
+        self.video_label.allow_pan = not self.setting_tracking
+
+        if self.setting_tracking:
+            self.set_tracking_button.setText("Finish Setting")
+            self.status_bar.showMessage("Click on the UAV to set tracking point")
+            self.video_label.setCursor(Qt.CrossCursor)
+        else:
+            self.set_tracking_button.setText("Set Tracking Point")
+            self.status_bar.showMessage("Tracking point set")
+            self.video_label.unsetCursor()
+            if self.tracking_point:
+                self.update_template_from_point(self.tracking_point)
+
+    def update_template_from_point(self, point):
+        if self.tracking_point and self.current_frame is not None:
+            x = self.tracking_point.x()
+            y = self.tracking_point.y()
+            frame_gray = cv2.cvtColor(self.current_frame, cv2.COLOR_BGR2GRAY)
+            half_size = self.template_size // 2
+
+            x1 = max(0, x - half_size)
+            y1 = max(0, y - half_size)
+            x2 = min(frame_gray.shape[1], x + half_size)
+            y2 = min(frame_gray.shape[0], y + half_size)
+
+            self.template = frame_gray[y1:y2, x1:x2]
 
     def set_trajectory_style(self):
         dialog = QtWidgets.QDialog(self)
@@ -169,11 +258,9 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
                 self.display_frame(self.current_frame)
 
     def draw_dashed_line(self, img, pt1, pt2, color, thickness, dash_length, gap_length):
-        """Draw a dashed line between two points"""
         dist = np.sqrt((pt2[0] - pt1[0])**2 + (pt2[1] - pt1[1])**2)
         if dist == 0:
             return
-
 
         dx = (pt2[0] - pt1[0]) / dist
         dy = (pt2[1] - pt1[1]) / dist
@@ -190,6 +277,7 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
         self.trajectory = []
         if self.current_frame is not None:
             self.display_frame(self.current_frame)
+        self.tracking_point = None
 
     def check_video_fps(self):
         if self.cap is None: return
@@ -206,43 +294,6 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
                )
 
         QMessageBox.information(self, "FPS Analysis", msg)
-
-    def video_label_clicked(self, event):
-        try:
-            if self.current_frame is None or not self.video_label.base_pixmap:
-                return
-
-            source_pos = self.video_label.mapToSource(event.pos())
-            x = source_pos.x()
-            y = source_pos.y()
-
-            frame_height, frame_width = self.current_frame.shape[:2]
-            x = max(0, min(frame_width-1, x))
-            y = max(0, min(frame_height-1, y))
-
-            self.tracking_point = QPoint(x, y)
-
-            frame_gray = cv2.cvtColor(self.current_frame, cv2.COLOR_BGR2GRAY)
-            half_size = self.template_size // 2
-
-            x1 = max(0, x - half_size)
-            y1 = max(0, y - half_size)
-            x2 = min(frame_width, x + half_size)
-            y2 = min(frame_height, y + half_size)
-
-            self.template = frame_gray[y1:y2, x1:x2]
-            self.tracking_active = True
-
-            marker_frame = self.current_frame.copy()
-            cv2.drawMarker(marker_frame, (x, y), (0, 255, 255),
-                           markerType=cv2.MARKER_CROSS,
-                           markerSize=20,
-                           thickness=2)
-            self.display_frame(marker_frame)
-            self.status_bar.showMessage(f"Tracking point: ({x}, {y})")
-
-        except Exception as e:
-            self.status_bar.showMessage(f"Error: {str(e)}")
 
     def load_video(self):
         options = QFileDialog.Options()
@@ -288,6 +339,7 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
 
             self.play_button.setEnabled(True)
             self.set_scale_button.setEnabled(True)
+            self.set_tracking_button.setEnabled(True)
             self.prev_frame_button.setEnabled(True)
             self.next_frame_button.setEnabled(True)
             self.check_fps_button.setEnabled(True)
@@ -327,22 +379,33 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
             x = self.tracking_point.x()
             y = self.tracking_point.y()
 
-            # Draw tracking point (red circle)
-            cv2.circle(frame_rgb, (x, y), self.tracking_radius, (255, 0, 0), 2)
+            cv2.circle(frame_rgb, (x, y),
+                       self.tracking_radius,
+                       (255, 0, 0),  # blue
+                       2)
 
-            # Draw template area (green rectangle)
+            half_size = self.template_size // 2
             cv2.rectangle(frame_rgb,
-                          (x - self.template_size//2, y - self.template_size//2),
-                          (x + self.template_size//2, y + self.template_size//2),
-                          (0, 255, 0), 1)
+                          (x - half_size, y - half_size),
+                          (x + half_size, y + half_size),
+                          (0, 255, 0),  # green
+                          1)  # thickness
 
-        # Display frame
+            cv2.drawMarker(frame_rgb,
+                           (x, y),
+                           (255, 255, 0),  # yellow
+                           markerType=cv2.MARKER_CROSS,
+                           markerSize=20,
+                           thickness=2)
+
         h, w, ch = frame_rgb.shape
         bytes_per_line = ch * w
         q_img = QtGui.QImage(frame_rgb.data, w, h, bytes_per_line,
                              QtGui.QImage.Format_RGB888)
         pixmap = QtGui.QPixmap.fromImage(q_img)
+
         self.video_label.setPixmap(pixmap)
+        self.video_label.update_display()
 
     def update_frame(self):
         if self.paused or not self.cap or not self.cap.isOpened():
@@ -362,12 +425,10 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
         if self.tracking_active and self.tracking_point and self.template is not None:
             frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-            # Add current point to trajectory (limit size)
             self.trajectory.append((self.tracking_point.x(), self.tracking_point.y()))
             if len(self.trajectory) > self.max_trajectory_points:
                 self.trajectory.pop(0)
 
-            # Get current tracking position
             x, y = self.tracking_point.x(), self.tracking_point.y()
 
             # Define search area
@@ -379,17 +440,14 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
 
             search_area = frame_gray[y1:y2, x1:x2]
 
-            # Perform template matching
             try:
                 res = cv2.matchTemplate(search_area, self.template, cv2.TM_CCOEFF_NORMED)
                 min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
 
-                # Update tracking point
                 new_x = x1 + max_loc[0] + self.template.shape[1] // 2
                 new_y = y1 + max_loc[1] + self.template.shape[0] // 2
                 self.tracking_point = QPoint(new_x, new_y)
 
-                # Store position and time
                 if len(self.positions) < self.frame_count:
                     self.positions.append((new_x, new_y))
                     self.timestamps.append(current_time)
@@ -397,7 +455,6 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
                     self.positions[self.frame_count-1] = (new_x, new_y)
                     self.timestamps[self.frame_count-1] = current_time
 
-                # Calculate metrics
                 if len(self.positions) > 1:
                     prev_x, prev_y = self.positions[-2]
                     curr_x, curr_y = self.positions[-1]
@@ -412,7 +469,6 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
                         else:
                             self.velocities[-1] = velocity
 
-                        # Calculate acceleration
                         if len(self.velocities) > 1:
                             velocity_diff = self.velocities[-1] - self.velocities[-2]
                             acceleration = velocity_diff / time_diff
@@ -421,7 +477,6 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
                             else:
                                 self.accelerations[-1] = acceleration
 
-                # Update template every 5 frames
                 if self.frame_count % 5 == 0:
                     half_size = self.template_size // 2
                     x1 = max(0, new_x - half_size)
@@ -429,8 +484,6 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
                     x2 = min(frame_gray.shape[1], new_x + half_size)
                     y2 = min(frame_gray.shape[0], new_y + half_size)
                     self.template = frame_gray[y1:y2, x1:x2]
-
-                self.prev_gray = frame_gray
 
             except Exception as e:
                 self.status_bar.showMessage(f"Tracking error: {str(e)}")
@@ -510,17 +563,13 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
                     status_msg += f": Position ({self.tracking_point.x()}, {self.tracking_point.y()})"
                 self.status_bar.showMessage(status_msg)
 
-    def reopen_video(self):
-        if hasattr(self, 'video_path'):
-            self.cap = cv2.VideoCapture(self.video_path)
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.frame_count)
     def toggle_play(self):
         self.paused = not self.paused
         self.play_button.setText("Pause" if not self.paused else "Play")
 
         if not self.paused:
             if self.tracking_point is None:
-                QMessageBox.warning(self, "Warning", "Please click on the UAV to set tracking point first.")
+                QMessageBox.warning(self, "Warning", "Please set tracking point first using 'Set Tracking Point' button.")
                 self.paused = True
                 self.play_button.setText("Play")
                 return
@@ -545,17 +594,14 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
         if not ret:
             return
 
-        # Store current position
         current_pos = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
 
-        # Convert frame for display
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, ch = frame.shape
         bytes_per_line = ch * w
         q_img = QtGui.QImage(frame.data, w, h, bytes_per_line, QtGui.QImage.Format_RGB888)
         pixmap = QtGui.QPixmap.fromImage(q_img)
 
-        # Create scale dialog
         scale_dialog = QtWidgets.QDialog(self)
         scale_dialog.setWindowTitle("Set Scale")
         label = QLabel(scale_dialog)
@@ -573,7 +619,6 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
                 y = event.pos().y() * pixmap.height() / label.height()
                 self.scale_points.append(QPoint(int(x), int(y)))
 
-                # Draw point
                 painter = QtGui.QPainter(label.pixmap())
                 painter.setPen(QtGui.QPen(Qt.red, 5))
                 painter.drawPoint(int(x * label.width() / pixmap.width()),
@@ -582,7 +627,6 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
                 label.update()
 
                 if len(self.scale_points) == 2:
-                    # Draw line
                     painter = QtGui.QPainter(label.pixmap())
                     painter.setPen(QtGui.QPen(Qt.green, 2))
                     p1 = self.scale_points[0]
@@ -595,13 +639,11 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
                     painter.end()
                     label.update()
 
-                    # Ask for real length
                     length, ok = QInputDialog.getDouble(
                         scale_dialog, "Enter Length",
                         "Enter the real-world length in meters:",
                         1.0, 0.01, 100.0, 2)
                     if ok:
-                        # Calculate scale factor
                         dx = p2.x() - p1.x()
                         dy = p2.y() - p1.y()
                         pixel_length = (dx**2 + dy**2)**0.5
@@ -613,7 +655,6 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
         label.mousePressEvent = on_click
         scale_dialog.exec_()
 
-        # Return to original frame position
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, current_pos)
 
     def update_table(self):
@@ -623,7 +664,6 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
         self.table.setRowCount(len(self.positions))
 
         for i in range(len(self.positions)):
-            # Calculate cumulative distance
             dist = sum(
                 ((self.positions[j][0] - self.positions[j-1][0])**2 +
                  (self.positions[j][1] - self.positions[j-1][1])**2)**0.5 * self.scale_factor
@@ -635,7 +675,6 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
             if i > 0 and i-1 < len(self.velocities):
                 vel = self.velocities[i-1]
 
-            # Acceleration calculatio
             accel = 0.0
             if i > 1 and i-2 < len(self.accelerations):
                 accel = self.accelerations[i-2]
@@ -698,11 +737,6 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
 
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to export data: {str(e)}")
-
-    def closeEvent(self, event):
-        if self.cap and self.cap.isOpened():
-            self.cap.release()
-        event.accept()
 
 if __name__ == "__main__":
     app = QtWidgets.QApplication(sys.argv)

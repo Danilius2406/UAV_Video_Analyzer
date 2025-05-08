@@ -1,8 +1,11 @@
-from PyQt5.QtCore import Qt, QPoint
+from PyQt5.QtCore import Qt, QPoint, pyqtSignal
 from PyQt5.QtWidgets import QLabel
 from PyQt5.QtGui import QPainter, QPixmap, QWheelEvent
 
 class ZoomableVideoWidget(QLabel):
+    zoomChanged = pyqtSignal()
+    clicked = pyqtSignal(QPoint)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.zoom_factor = 1.0
@@ -10,10 +13,16 @@ class ZoomableVideoWidget(QLabel):
         self.offset = QPoint(0, 0)
         self.setAlignment(Qt.AlignCenter)
         self.setMouseTracking(True)
+        self.dragging = False
+        self.drag_start_pos = QPoint()
+        self.allow_pan = True
 
     def setPixmap(self, pixmap):
-        self.base_pixmap = pixmap
-        self.update_display()
+        try:
+            self.base_pixmap = pixmap.copy() if pixmap else None
+            self.update_display()
+        except Exception as e:
+            print(f"Pixmap error: {str(e)}")
 
     def wheelEvent(self, event: QWheelEvent):
         zoom_speed = 1.10
@@ -30,7 +39,32 @@ class ZoomableVideoWidget(QLabel):
         self.offset += mouse_pos - new_pos
 
         self.update_display()
+        self.zoomChanged.emit()
         event.accept()
+
+    def mousePressEvent(self, event):
+        if self.allow_pan and event.button() == Qt.LeftButton:
+            self.dragging = True
+            self.drag_start_pos = event.pos()
+            self.setCursor(Qt.ClosedHandCursor)
+        else:
+            source_pos = self.mapToSource(event.pos())
+            self.clicked.emit(source_pos)
+
+
+    def mouseMoveEvent(self, event):
+        if self.dragging and self.allow_pan:
+            delta = event.pos() - self.drag_start_pos
+            self.offset += delta
+            self.drag_start_pos = event.pos()
+            self.update_display()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.dragging = False
+            self.setCursor(Qt.ArrowCursor)
+        super().mouseReleaseEvent(event)
 
     def mapToSource(self, pos):
         if not self.base_pixmap:
@@ -69,8 +103,3 @@ class ZoomableVideoWidget(QLabel):
         painter.end()
 
         super().setPixmap(final_pixmap)
-
-    def reset_view(self):
-        self.zoom_factor = 1.0
-        self.offset = QPoint(0, 0)
-        self.update_display()
