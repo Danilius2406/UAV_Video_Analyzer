@@ -8,7 +8,7 @@ from PyQt5.QtWidgets import (QFileDialog, QVBoxLayout, QPushButton,
                              QSpinBox, QFormLayout)
 from PyQt5.QtCore import QTimer, Qt, QPoint
 import sys
-
+import traceback
 from zoom_handler import ZoomableVideoWidget
 
 
@@ -27,9 +27,9 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
         self.frame_count = 0
         self.tracking_point = None
         self.tracking_radius = 15
-        self.search_radius = 100  # Increased search radius for better tracking
+        self.search_radius = 50
         self.template = None
-        self.template_size = 50  # Larger template for better matching
+        self.template_size = 50
         self.user_declared_fps = 30.0
         self.current_frame = None
         self.tracking_active = False
@@ -43,6 +43,15 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
         self.max_trajectory_points = 1000  # Maximum points to keep in trajectory
         self.video_label.clicked.connect(self.handle_video_click)
         self.setting_tracking = False
+
+        self.kalman = cv2.KalmanFilter(4, 2)
+        self.init_kalman()
+        self.template_alpha = 0.95  # Template update blending factor
+        self.min_confidence = 0.5
+        self.max_speed = 20 #px/frame
+        self.min_accel_threshold = 0.3
+        self.accel_smoothing = 0.85
+        self.expected_accel_direction = 1
 
     def initUI(self):
         self.setWindowTitle("UAV Tracking Analyzer")
@@ -128,6 +137,14 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
 
         self.status_bar = self.statusBar()
 
+
+    def init_kalman(self):
+        self.kalman.measurementMatrix = np.array([[1,0,0,0], [0,1,0,0]], np.float32)
+        self.kalman.transitionMatrix = np.array([[1,0,1,0], [0,1,0,1], [0,0,1,0], [0,0,0,1]], np.float32)
+        self.kalman.processNoiseCov = np.eye(4, dtype=np.float32) * 0.05
+        self.kalman.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.3
+        self.kalman.errorCovPost = np.eye(4, dtype=np.float32)
+
     def handle_video_click(self, pos):
         try:
             if not self.setting_tracking or self.current_frame is None:
@@ -155,6 +172,9 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
 
             self.tracking_point = QPoint(x, y)
             self.tracking_active = True
+
+            self.kalman.statePost = np.array([[x], [y], [0], [0]], dtype=np.float32)
+            self.kalman_initialized = True
 
             frame_gray = cv2.cvtColor(self.current_frame, cv2.COLOR_BGR2GRAY)
             half_size = self.template_size // 2
@@ -424,29 +444,88 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
 
         if self.tracking_active and self.tracking_point and self.template is not None:
             frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            x_prev, y_prev = self.tracking_point.x(), self.tracking_point.y()
 
-            self.trajectory.append((self.tracking_point.x(), self.tracking_point.y()))
+            self.trajectory.append((x_prev, y_prev))
             if len(self.trajectory) > self.max_trajectory_points:
                 self.trajectory.pop(0)
 
-            x, y = self.tracking_point.x(), self.tracking_point.y()
-
-            # Define search area
-            margin = self.search_radius
-            x1 = max(0, x - margin)
-            y1 = max(0, y - margin)
-            x2 = min(frame_gray.shape[1], x + margin)
-            y2 = min(frame_gray.shape[0], y + margin)
-
-            search_area = frame_gray[y1:y2, x1:x2]
-
             try:
+                margin = self.search_radius
+                x1 = max(0, x_prev - margin)
+                y1 = max(0, y_prev - margin)
+                x2 = min(frame_gray.shape[1], x_prev + margin)
+                y2 = min(frame_gray.shape[0], y_prev + margin)
+
+                if x1 >= x2 or y1 >= y2:
+                    raise ValueError("Invalid search area")
+
+                search_area = frame_gray[y1:y2, x1:x2]
+
                 res = cv2.matchTemplate(search_area, self.template, cv2.TM_CCOEFF_NORMED)
                 min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
 
-                new_x = x1 + max_loc[0] + self.template.shape[1] // 2
-                new_y = y1 + max_loc[1] + self.template.shape[0] // 2
-                self.tracking_point = QPoint(new_x, new_y)
+                if max_val < self.min_confidence:
+                    raise ValueError(f"Low match confidence: {max_val:.2f}")
+
+                (py, px) = np.unravel_index(np.argmax(res), res.shape[::-1])
+                if 0 < px < res.shape[1]-1 and 0 < py < res.shape[0]-1:
+                    dx = res[py, px+1] - res[py, px-1]
+                    dy = res[py+1, px] - res[py-1, px]
+                    dxx = res[py, px+1] + res[py, px-1] - 2*max_val
+                    dyy = res[py+1, px] + res[py-1, px] - 2*max_val
+                    subpixel_x = px + (dx / (2*dxx)) if dxx != 0 else px
+                    subpixel_y = py + (dy / (2*dyy)) if dyy != 0 else py
+                else:
+                    subpixel_x = px
+                    subpixel_y = py
+
+                new_x = x1 + subpixel_x + self.template.shape[1]//2
+                new_y = y1 + subpixel_y + self.template.shape[0]//2
+
+                if not hasattr(self, 'kalman_initialized'):
+                    self.kalman.statePost = np.array([[new_x], [new_y], [0], [0]], dtype=np.float32)
+                    self.kalman_initialized = True
+
+                prediction = self.kalman.predict()
+                measured = np.array([[np.float32(new_x)], [np.float32(new_y)]])
+                self.kalman.correct(measured)
+
+                filtered_pos = self.kalman.statePost[:2].ravel()
+                new_x, new_y = filtered_pos[0], filtered_pos[1]
+
+                if len(self.positions) >= 1:
+                    prev_x, prev_y = self.positions[-1]
+                    dx = new_x - prev_x
+                    dy = new_y - prev_y
+                    max_speed = 20
+                    distance = np.hypot(dx, dy)
+
+                    if distance > max_speed:
+                        angle = np.arctan2(dy, dx)
+                        new_x = prev_x + max_speed * np.cos(angle)
+                        new_y = prev_y + max_speed * np.sin(angle)
+
+
+                    if not np.isnan(new_x) and not np.isnan(new_y):
+                        self.tracking_point = QPoint(int(round(new_x)), int(round(new_y)))
+                    else:
+                        self.tracking_active = False
+
+                half_size = self.template_size // 2
+                x1_t = max(0, int(new_x) - half_size)
+                y1_t = max(0, int(new_y) - half_size)
+                x2_t = min(frame_gray.shape[1], int(new_x) + half_size)
+                y2_t = min(frame_gray.shape[0], int(new_y) + half_size)
+
+                if x1_t < x2_t and y1_t < y2_t:
+                    current_patch = frame_gray[y1_t:y2_t, x1_t:x2_t]
+                    if current_patch.shape == self.template.shape and self.frame_count > 5:
+                        self.template = cv2.addWeighted(
+                            self.template, self.template_alpha,
+                            current_patch, 1 - self.template_alpha,
+                            0
+                        )
 
                 if len(self.positions) < self.frame_count:
                     self.positions.append((new_x, new_y))
@@ -455,41 +534,59 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
                     self.positions[self.frame_count-1] = (new_x, new_y)
                     self.timestamps[self.frame_count-1] = current_time
 
-                if len(self.positions) > 1:
-                    prev_x, prev_y = self.positions[-2]
-                    curr_x, curr_y = self.positions[-1]
-                    distance_px = ((curr_x - prev_x)**2 + (curr_y - prev_y)**2)**0.5
-                    distance_m = distance_px * self.scale_factor
-
-                    time_diff = current_time - self.timestamps[-2]
-                    if time_diff > 0:
-                        velocity = distance_m / time_diff
-                        if len(self.velocities) < len(self.positions) - 1:
-                            self.velocities.append(velocity)
-                        else:
-                            self.velocities[-1] = velocity
-
-                        if len(self.velocities) > 1:
-                            velocity_diff = self.velocities[-1] - self.velocities[-2]
-                            acceleration = velocity_diff / time_diff
-                            if len(self.accelerations) < len(self.velocities) - 1:
-                                self.accelerations.append(acceleration)
-                            else:
-                                self.accelerations[-1] = acceleration
-
-                if self.frame_count % 5 == 0:
-                    half_size = self.template_size // 2
-                    x1 = max(0, new_x - half_size)
-                    y1 = max(0, new_y - half_size)
-                    x2 = min(frame_gray.shape[1], new_x + half_size)
-                    y2 = min(frame_gray.shape[0], new_y + half_size)
-                    self.template = frame_gray[y1:y2, x1:x2]
-
             except Exception as e:
-                self.status_bar.showMessage(f"Tracking error: {str(e)}")
+                if hasattr(self, 'kalman_initialized'):
+                    prediction = self.kalman.predict()
+                    new_x, new_y = prediction[0], prediction[1]
+                    self.tracking_point = QPoint(int(new_x), int(new_y))
+                    self.status_bar.showMessage(f"Tracking warning: {str(e)}, using prediction")
+                else:
+                    self.tracking_active = False
+                    self.status_bar.showMessage(f"Tracking failed: {str(e)}")
+
+
+        if len(self.positions) >= 2:
+            dt = 1.0 / self.user_declared_fps
+            # Velocity calculation with moving average
+            velocity_window = 3
+            velocities = []
+            for i in range(1, min(velocity_window, len(self.positions))):
+                dx = self.positions[-1][0] - self.positions[-i-1][0]
+                dy = self.positions[-1][1] - self.positions[-i-1][1]
+                distance_px = np.hypot(dx, dy)
+                time_diff = i / self.user_declared_fps
+                velocities.append(distance_px * self.scale_factor / time_diff)
+
+            velocity = np.mean(velocities) if velocities else 0
+            if len(self.velocities) < len(self.positions) - 1:
+                self.velocities.append(velocity)
+            else:
+                self.velocities[-1] = velocity
+
+
+            accel = 0.0
+            self.accel_window = 5
+            self.max_accel = 15.0
+            if len(self.velocities) >= self.accel_window:
+                v_values = self.velocities[-self.accel_window:]
+                t_values = [i*dt for i in range(len(v_values))]
+
+                A = np.vstack([t_values, np.ones(len(t_values))]).T
+                slope, _ = np.linalg.lstsq(A, v_values, rcond=None)[0]
+                accel = slope
+
+                if abs(accel) > self.max_accel:
+                    accel = np.clip(accel, -self.max_accel, self.max_accel)
+
+                if len(self.accelerations) > 0:
+                    accel = 0.5 * accel + 0.5 * self.accelerations[-1]
+
+                self.accelerations.append(accel)
+
 
         self.display_frame(frame)
         self.update_table()
+
 
     def prev_frame(self):
         if self.cap is not None and self.cap.isOpened():
@@ -497,7 +594,6 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
             self.play_button.setText("Play")
 
             current_frame_pos = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
-
             prev_frame_number = max(0, current_frame_pos - 2)
 
             try:
@@ -509,12 +605,14 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
                     self.frame_count = prev_frame_number + 1
 
                     if len(self.positions) > self.frame_count - 1:
-                        x, y = self.positions[self.frame_count - 1]
+                        x = int(round(self.positions[self.frame_count - 1][0]))
+                        y = int(round(self.positions[self.frame_count - 1][1]))
                         self.tracking_point = QPoint(x, y)
 
                         if self.tracking_active and x is not None and y is not None:
                             frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                             half_size = self.template_size // 2
+
                             x1 = max(0, x - half_size)
                             y1 = max(0, y - half_size)
                             x2 = min(frame_gray.shape[1], x + half_size)
@@ -532,6 +630,7 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
                 self.status_bar.showMessage(f"Error: {str(e)}")
                 self.cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame_pos)
 
+
     def next_frame(self):
         if self.cap is not None:
             self.paused = True
@@ -542,17 +641,21 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
                 self.frame_count += 1
 
                 if len(self.positions) >= self.frame_count:
-                    x, y = self.positions[self.frame_count - 1]
+                    x = int(round(self.positions[self.frame_count - 1][0]))
+                    y = int(round(self.positions[self.frame_count - 1][1]))
                     self.tracking_point = QPoint(x, y)
 
                     if self.tracking_active:
                         frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                         half_size = self.template_size // 2
+
                         x1 = max(0, x - half_size)
                         y1 = max(0, y - half_size)
                         x2 = min(frame_gray.shape[1], x + half_size)
                         y2 = min(frame_gray.shape[0], y + half_size)
-                        self.template = frame_gray[y1:y2, x1:x2]
+
+                        if x1 < x2 and y1 < y2:
+                            self.template = frame_gray[y1:y2, x1:x2]
                 else:
                     self.tracking_point = None
                     self.tracking_active = False
