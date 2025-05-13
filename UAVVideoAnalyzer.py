@@ -789,7 +789,7 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
 
     def export_data(self):
         if len(self.positions) < 1:
-            QMessageBox.warning(self, "Error", "Not enough data to export.")
+            QtWidgets.QMessageBox.warning(self, "Error", "Not enough data to export.")
             return
 
         options = QFileDialog.Options()
@@ -811,35 +811,64 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
                 }
 
                 for i in range(len(self.positions)):
-                    x, y = self.positions[i]
-                    dist = sum(
-                        ((self.positions[j][0] - self.positions[j-1][0])**2 +
-                         (self.positions[j][1] - self.positions[j-1][1])**2)**0.5 * self.scale_factor
-                        for j in range(1, i+1)) if i > 0 else 0
-
-                    time_val = self.timestamps[i]
-                    vel = self.velocities[i-1] if i > 0 and i-1 < len(self.velocities) else 0
-                    accel = self.accelerations[i-2] if i > 1 and i-2 < len(self.accelerations) else 0
+                    dist = 0.0
+                    if i > 0:
+                        prev_x, prev_y = self.positions[i-1]
+                        curr_x, curr_y = self.positions[i]
+                        step_dist = np.hypot(curr_x - prev_x, curr_y - prev_y) * self.scale_factor
+                        dist = data["Distance (m)"][i-1] + step_dist
 
                     data["Frame"].append(i+1)
-                    data["X (px)"].append(x)
-                    data["Y (px)"].append(y)
+                    data["X (px)"].append(self.positions[i][0])
+                    data["Y (px)"].append(self.positions[i][1])
                     data["Distance (m)"].append(dist)
-                    data["Time (s)"].append(time_val)
-                    data["Velocity (m/s)"].append(vel)
-                    data["Acceleration (m/s²)"].append(accel)
+                    data["Time (s)"].append(self.timestamps[i])
+                    data["Velocity (m/s)"].append(self.velocities[i] if i < len(self.velocities) else 0.0)
+                    data["Acceleration (m/s²)"].append(self.accelerations[i] if i < len(self.accelerations) else 0.0)
 
                 df = pd.DataFrame(data)
 
-                if file_path.endswith('.xlsx'):
-                    df.to_excel(file_path, index=False)
-                else:
-                    df.to_csv(file_path, index=False)
+                metadata_dict = {
+                    "Video Path": self.video_path,
+                    "Video Resolution": f"{int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}",
+                    "Analysis FPS": self.user_declared_fps,
+                    "Scale Factor (m/px)": f"{self.scale_factor:.6f}",
+                    "Export Date": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+                }
 
-                QMessageBox.information(self, "Success", f"Data exported to {file_path}")
+                if file_path.endswith('.xlsx'):
+                    with pd.ExcelWriter(file_path) as writer:
+                        pd.DataFrame(list(metadata_dict.items()), columns=['Parameter', 'Value']).to_excel(
+                            writer,
+                            sheet_name='Metadata',
+                            index=False
+                        )
+
+                        df.to_excel(
+                            writer,
+                            sheet_name='Tracking Data',
+                            index=False,
+                            float_format="%.3f"
+                        )
+
+                else:  # CSV
+                    with open(file_path, 'w', encoding='utf-8') as f:
+                        f.write("# UAV Tracking Analysis Export\n")
+                        for key, value in metadata_dict.items():
+                            f.write(f"# {key}: {value}\n")
+                        f.write("#\n")
+
+                        df.to_csv(
+                            f,
+                            index=False,
+                            float_format="%.3f"
+                        )
+
+                QtWidgets.QMessageBox.information(self, "Success", f"Data exported successfully to:\n{file_path}")
 
             except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to export data: {str(e)}")
+                error_msg = f"Export error: {str(e)}\n\n{traceback.format_exc()}"
+                QtWidgets.QMessageBox.critical(self, "Error", error_msg)
 
 if __name__ == "__main__":
     app = QtWidgets.QApplication(sys.argv)
