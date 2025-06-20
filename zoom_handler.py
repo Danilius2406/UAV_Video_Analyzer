@@ -51,7 +51,6 @@ class ZoomableVideoWidget(QLabel):
             source_pos = self.mapToSource(event.pos())
             self.clicked.emit(source_pos)
 
-
     def mouseMoveEvent(self, event):
         if self.dragging and self.allow_pan:
             delta = event.pos() - self.drag_start_pos

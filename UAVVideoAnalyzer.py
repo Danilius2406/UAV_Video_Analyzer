@@ -11,7 +11,6 @@ import sys
 import traceback
 from zoom_handler import ZoomableVideoWidget
 
-
 class UAVAnalyzer(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -26,10 +25,10 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
         self.fps = 30
         self.frame_count = 0
         self.tracking_point = None
-        self.tracking_radius = 15
         self.search_radius = 50
         self.template = None
         self.template_size = 50
+        self.tracking_radius = self.template_size // 2
         self.user_declared_fps = 30.0
         self.current_frame = None
         self.tracking_active = False
@@ -49,9 +48,9 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
         self.template_alpha = 0.95  # Template update blending factor
         self.min_confidence = 0.5
         self.max_speed = 20 #px/frame
-        self.min_accel_threshold = 0.3
-        self.accel_smoothing = 0.85
-        self.expected_accel_direction = 1
+        self.MAX_PHYSICAL_ACCEL = 50.0
+        self.MIN_PHYSICAL_ACCEL = -50.0
+        self.velocity_filter = None
 
     def initUI(self):
         self.setWindowTitle("UAV Tracking Analyzer")
@@ -139,11 +138,26 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
 
 
     def init_kalman(self):
-        self.kalman.measurementMatrix = np.array([[1,0,0,0], [0,1,0,0]], np.float32)
-        self.kalman.transitionMatrix = np.array([[1,0,1,0], [0,1,0,1], [0,0,1,0], [0,0,0,1]], np.float32)
-        self.kalman.processNoiseCov = np.eye(4, dtype=np.float32) * 0.05
-        self.kalman.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.3
+        self.kalman = cv2.KalmanFilter(4, 2)
+        self.kalman.measurementMatrix = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], dtype=np.float32)
+        self.kalman.transitionMatrix = np.array([[1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]], dtype=np.float32)
+        self.kalman.processNoiseCov = np.eye(4, dtype=np.float32) * 0.01
+        self.kalman.measurementNoiseCov = np.eye(2, dtype=np.float32) * 1.0
         self.kalman.errorCovPost = np.eye(4, dtype=np.float32)
+
+        self.velocity_filter = cv2.KalmanFilter(2, 1)
+        self.velocity_filter.measurementMatrix = np.array([[1, 0]], dtype=np.float32)
+        self.velocity_filter.transitionMatrix = np.array([[1, 1], [0, 1]], dtype=np.float32)
+        self.velocity_filter.processNoiseCov = np.array([[0.07, 0.0], [0.0, 0.2]], dtype=np.float32)
+        self.velocity_filter.measurementNoiseCov = np.eye(1, dtype=np.float32) * 0.3
+        self.velocity_filter.errorCovPost = np.eye(2, dtype=np.float32)
+
+        self.accel_filter = cv2.KalmanFilter(1, 1)
+        self.accel_filter.measurementMatrix = np.eye(1, dtype=np.float32)
+        self.accel_filter.transitionMatrix = np.eye(1, dtype=np.float32)
+        self.accel_filter.processNoiseCov = np.eye(1, dtype=np.float32) * 0.1
+        self.accel_filter.measurementNoiseCov = np.eye(1, dtype=np.float32) * 10.0
+        self.accel_filter.errorCovPost = np.eye(1, dtype=np.float32)
 
     def handle_video_click(self, pos):
         try:
@@ -401,13 +415,12 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
 
             cv2.circle(frame_rgb, (x, y),
                        self.tracking_radius,
-                       (255, 0, 0),  # blue
+                       (255, 0, 0),  # red
                        2)
 
-            half_size = self.template_size // 2
             cv2.rectangle(frame_rgb,
-                          (x - half_size, y - half_size),
-                          (x + half_size, y + half_size),
+                          (x - self.search_radius, y - self.search_radius),
+                          (x + self.search_radius, y + self.search_radius),
                           (0, 255, 0),  # green
                           1)  # thickness
 
@@ -461,7 +474,6 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
                     raise ValueError("Invalid search area")
 
                 search_area = frame_gray[y1:y2, x1:x2]
-
                 res = cv2.matchTemplate(search_area, self.template, cv2.TM_CCOEFF_NORMED)
                 min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
 
@@ -498,14 +510,12 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
                     prev_x, prev_y = self.positions[-1]
                     dx = new_x - prev_x
                     dy = new_y - prev_y
-                    max_speed = 20
                     distance = np.hypot(dx, dy)
 
-                    if distance > max_speed:
+                    if distance > self.max_speed:
                         angle = np.arctan2(dy, dx)
-                        new_x = prev_x + max_speed * np.cos(angle)
-                        new_y = prev_y + max_speed * np.sin(angle)
-
+                        new_x = prev_x + self.max_speed * np.cos(angle)
+                        new_y = prev_y + self.max_speed * np.sin(angle)
 
                     if not np.isnan(new_x) and not np.isnan(new_y):
                         self.tracking_point = QPoint(int(round(new_x)), int(round(new_y)))
@@ -544,45 +554,60 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
                     self.tracking_active = False
                     self.status_bar.showMessage(f"Tracking failed: {str(e)}")
 
-
         if len(self.positions) >= 2:
             dt = 1.0 / self.user_declared_fps
-            # Velocity calculation with moving average
-            velocity_window = 3
-            velocities = []
-            for i in range(1, min(velocity_window, len(self.positions))):
-                dx = self.positions[-1][0] - self.positions[-i-1][0]
-                dy = self.positions[-1][1] - self.positions[-i-1][1]
-                distance_px = np.hypot(dx, dy)
-                time_diff = i / self.user_declared_fps
-                velocities.append(distance_px * self.scale_factor / time_diff)
 
-            velocity = np.mean(velocities) if velocities else 0
-            if len(self.velocities) < len(self.positions) - 1:
-                self.velocities.append(velocity)
+            # 1. Розрахунок поточної швидкості в пікселях/кадр
+            dx_px = self.positions[-1][0] - self.positions[-2][0]
+            dy_px = self.positions[-1][1] - self.positions[-2][1]
+            speed_px = np.hypot(dx_px, dy_px)
+
+            # 2. Конвертація в м/с
+            current_velocity = speed_px * self.scale_factor / dt
+
+            # 3. Фільтрація швидкості
+            if self.velocity_filter is not None:
+                self.velocity_filter.predict()
+                filtered_velocity = self.velocity_filter.correct(
+                    np.array([[current_velocity]], dtype=np.float32)
+                )[0, 0]
             else:
-                self.velocities[-1] = velocity
+                filtered_velocity = current_velocity
 
+            # 4. Розрахунок прискорення
+            if len(self.velocities) >= 1:
+                prev_velocity = self.velocities[-1]
+                current_accel = (filtered_velocity - prev_velocity) / dt
 
-            accel = 0.0
-            self.accel_window = 5
-            self.max_accel = 15.0
-            if len(self.velocities) >= self.accel_window:
-                v_values = self.velocities[-self.accel_window:]
-                t_values = [i*dt for i in range(len(v_values))]
+                current_accel = np.clip(current_accel,
+                                        self.MIN_PHYSICAL_ACCEL,
+                                        self.MAX_PHYSICAL_ACCEL)
 
-                A = np.vstack([t_values, np.ones(len(t_values))]).T
-                slope, _ = np.linalg.lstsq(A, v_values, rcond=None)[0]
-                accel = slope
+                # Фільтрація прискорення
+                if hasattr(self, 'accel_filter'):
+                    self.accel_filter.predict()
+                    filtered_accel = self.accel_filter.correct(
+                        np.array([[current_accel]], dtype=np.float32)
+                    )[0, 0]
+                else:
+                    filtered_accel = current_accel
+            else:
+                filtered_accel = 0.0
 
-                if abs(accel) > self.max_accel:
-                    accel = np.clip(accel, -self.max_accel, self.max_accel)
+            # 5. Збереження результатів
+            self.velocities.append(filtered_velocity)
+            self.accelerations.append(filtered_accel)
 
-                if len(self.accelerations) > 0:
-                    accel = 0.5 * accel + 0.5 * self.accelerations[-1]
+        elif len(self.positions) >= 1:
+            # Якщо тільки одна позиція - швидкість 0
+            self.velocities.append(0.0)
+            self.accelerations.append(0.0)
 
-                self.accelerations.append(accel)
-
+        # Відображення проміжних результатів для налагодження
+        if len(self.positions) >= 2:
+            print(f"Frame {self.frame_count}:")
+            print(f" Speed (px/fr): {speed_px:.2f} | Velocity (m/s): {current_velocity:.2f}")
+            print(f" Filtered vel: {filtered_velocity:.2f} | Acceleration: {filtered_accel:.2f}")
 
         self.display_frame(frame)
         self.update_table()
@@ -629,7 +654,6 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
             except Exception as e:
                 self.status_bar.showMessage(f"Error: {str(e)}")
                 self.cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame_pos)
-
 
     def next_frame(self):
         if self.cap is not None:
@@ -713,7 +737,6 @@ class UAVAnalyzer(QtWidgets.QMainWindow):
         layout.addWidget(label)
         scale_dialog.setLayout(layout)
 
-        # Get two points from user
         self.scale_points = []
 
         def on_click(event):
